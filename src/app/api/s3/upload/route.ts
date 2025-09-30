@@ -1,46 +1,97 @@
-import {z} from 'zod';
-import {NextResponse} from 'next/server';
-import {v4 as uuidv4} from 'uuid';
-import { PutObjectCommand } from '@aws-sdk/client-s3';
+import { NextRequest, NextResponse } from 'next/server';
+import { S3Client, PutObjectCommand } from '@aws-sdk/client-s3';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
-import { S3 } from '@/lib/s3Client';
+import { randomUUID } from 'crypto';
 
-const uploadSchema = z.object({
-    fileName: z.string(),
-    contentType: z.string(),
-    size: z.number()
-})
+const s3Client = new S3Client({
+  region: process.env.AWS_REGION || 'us-east-2',
+  credentials: {
+    accessKeyId: process.env.AWS_ACCESS_KEY_ID!,
+    secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY!,
+  },
+});
 
-export async function POST(request: Request) {
+const BUCKET_NAME = process.env.S3_BUCKET_NAME || 'microsaas-project-1';
 
-    try { 
-        const body = await request.json();
-        const parsed = uploadSchema.safeParse(body);
+export async function POST(request: NextRequest) {
+  try {
+    const { filename, contentType, size } = await request.json();
 
-        if(!parsed.success) {
-            return NextResponse.json({error: 'Invalid request body'}, {status: 400});
-        }
+    console.log('📥 Presigned URL request:', { filename, contentType, size });
 
-        const {fileName, contentType, size} = parsed.data;
-        const uniqueKey = `${uuidv4()}-${fileName}`;
-        const command = new PutObjectCommand({
-            Bucket: process.env.S3_BUCKET_NAME!,
-            Key: uniqueKey,
-            ContentType: contentType,
-            ContentLength: size
-        })
-
-        const preSignedUrl = await getSignedUrl(S3,  command, {
-            expiresIn: 360 // 6 minutes
-        } )
-
-        const response = {
-            preSignedUrl,
-            key: uniqueKey
-        }
-        return NextResponse.json(response, {status: 200});
-
-     } catch {
-         return NextResponse.json({error: 'Internal Server Error'}, {status: 500}); 
+    // Validate required fields
+    if (!filename || !contentType) {
+      console.error('❌ Missing required fields');
+      return NextResponse.json(
+        { error: 'filename and contentType are required' },
+        { status: 400 }
+      );
     }
+
+    // Optional: Add file size limit (10MB)
+    if (size && size > 10 * 1024 * 1024) {
+      console.error('❌ File too large:', size);
+      return NextResponse.json(
+        { error: 'File size too large. Maximum 10MB allowed.' },
+        { status: 400 }
+      );
+    }
+
+    // Generate unique file key with UUID to avoid conflicts - NO SUBFOLDERS
+    const fileExtension = filename.split('.').pop() || '';
+    const key = `${randomUUID()}.${fileExtension}`;
+
+    console.log('🔑 Generated key:', key);
+
+    // Create the put object command
+    const command = new PutObjectCommand({
+      Bucket: BUCKET_NAME,
+      Key: key,
+      ContentType: contentType,
+      Metadata: {
+        'original-filename': filename,
+        'upload-time': new Date().toISOString(),
+      },
+    });
+
+    // Generate presigned URL
+    const presignedUrl = await getSignedUrl(s3Client, command, {
+      expiresIn: 3600, // URL expires in 1 hour
+    });
+
+    // Public URL for accessing the file after upload
+    const publicUrl = `https://${BUCKET_NAME}.s3.${process.env.AWS_REGION || 'us-east-2'}.amazonaws.com/${key}`;
+
+    console.log('✅ Generated URLs:', { key, publicUrl });
+
+    return NextResponse.json({
+      presignedUrl,
+      key,
+      publicUrl,
+    });
+
+  } catch (error) {
+    console.error('❌ Error generating presigned URL:', error);
+    const errorMessage = error instanceof Error ? error.message : 'Unknown error occurred';
+    return NextResponse.json(
+      { 
+        error: 'Failed to generate presigned URL',
+        details: process.env.NODE_ENV === 'development' ? errorMessage : undefined
+      },
+      { status: 500 }
+    );
+  }
+}
+
+// Handle CORS preflight requests
+export async function OPTIONS(request: NextRequest) {
+  return new NextResponse(null, {
+    status: 200,
+    headers: {
+      'Access-Control-Allow-Origin': '*',
+      'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
+      'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Requested-With',
+      'Access-Control-Max-Age': '86400',
+    },
+  });
 }
